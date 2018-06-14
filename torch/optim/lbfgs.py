@@ -2,6 +2,8 @@ import torch
 from functools import reduce
 from .optimizer import Optimizer
 
+import math
+
 
 class LBFGS(Optimizer):
     """Implements L-BFGS algorithm.
@@ -74,6 +76,322 @@ class LBFGS(Optimizer):
             p.data.add_(step_size, update[offset:offset + numel].view_as(p.data))
             offset += numel
         assert offset == self._numel()
+
+    #FF copy the parameter values out, create a single vector
+    def _copy_params_out(self):
+        offset = 0
+        new_params = []
+        for p in self._params:
+            numel = p.numel()
+            new_param1=p.data.clone().view(-1)
+            offset += numel
+            new_params.append(new_param1)
+        assert offset == self._numel()
+        return torch.cat(new_params,0)
+
+    #FF copy the parameter values back, dividing the vector into a list
+    def _copy_params_in(self,new_params):
+        offset = 0
+        for p in self._params:
+            numel = p.numel()
+            p.data.copy_(new_params[offset:offset+numel].view_as(p.data))
+            offset += numel
+        assert offset == self._numel()
+
+    #FF line search xk=self._params, pk=gradient
+    def _linesearch(self,closure,pk,step):
+        """Line search (strong-Wolfe)
+
+        Arguments:
+            closure (callable): A closure that reevaluates the model
+                and returns the loss.
+            pk: gradient vector 
+            step: step size for differencing 
+        """
+
+
+        # constants
+        alpha1=10.0
+        sigma=0.1
+        rho=0.01
+        t1=9 
+        t2=0.1
+        t3=0.5
+        alphak=step # default return step
+ 
+        # state parameter 
+        state = self.state[self._params[0]]
+
+        # make a copy of original params
+        xk=self._copy_params_out()
+
+   
+        phi_0=float(closure())
+        tol=min(phi_0*0.01,1e-6)
+
+        # xp <- xk+step. pk
+        self._add_grad(step, pk) #FF param = param + t * grad 
+        p01=float(closure())
+        # xp <- xk-step. pk
+        self._add_grad(-2.0*step, pk) #FF param = param - t * grad 
+        p02=float(closure())
+
+        ##print("p01="+str(p01)+" p02="+str(p02))
+        gphi_0=(p01-p02)/(2.0*step)
+        ##print("tol="+str(tol)+" phi_0="+str(phi_0)+" gphi_0="+str(gphi_0))
+        # catch instances when step size is too small 
+        if abs(gphi_0)<1e-12:
+          return 1.0
+
+        mu=(tol-phi_0)/(rho*gphi_0)
+
+        ##print("mu="+str(mu))
+        
+        # counting function evals
+        closure_evals=3
+
+        ci=1
+        alphai=alpha1 # initial value for alpha(i) : check if 0<alphai<=mu 
+        alphai1=0.0
+        phi_alphai1=phi_0
+        while (ci<10) :
+          # evalualte phi(alpha(i))=f(xk+alphai pk)
+          self._copy_params_in(xk) # original
+          # xp <- xk+alphai. pk
+          self._add_grad(alphai, pk) #
+          phi_alphai=float(closure())
+          if phi_alphai<tol:
+             alphak=alphai 
+             print("Linesearch: condition 0 met")
+             break
+          if (phi_alphai>phi_0+alphai*gphi_0) or (ci>1 and phi_alphai>=phi_alphai1) :
+             # ai=alphai1, bi=alphai bracket
+             print("bracket "+str(alphai1)+","+str(alphai))
+             alphak=self._linesearch_zoom(closure,xk,pk,alphai1,alphai,phi_0,gphi_0,sigma,rho,t1,t2,t3,step)
+             print("Linesearch: condition 1 met") 
+             break
+
+          # evaluate grad(phi(alpha(i))) */
+          # note that self._params already is xk+alphai. pk, so only add the missing term
+          # xp <- xk+(alphai+step). pk
+          self._add_grad(step, pk) #FF param = param - t * grad 
+          p01=float(closure())
+          # xp <- xk+(alphai-step). pk
+          self._add_grad(-2.0*step, pk) #FF param = param - t * grad 
+          p02=float(closure())
+          gphi_i=(p01-p02)/(2.0*step);
+        
+          if (abs(gphi_i)<=-sigma*gphi_0):
+             alphak=alphai
+             print("Linesearch: condition 2 met") 
+             break
+
+          if gphi_i>=0.0 :
+             # ai=alphai, bi=alphai1 bracket
+             print("bracket "+str(alphai)+","+str(alphai1))
+             alphak=self._linesearch_zoom(closure,xk,pk,alphai,alphai1,phi_0,gphi_0,sigma,rho,t1,t2,t3,step)
+             print("Linesearch: condition 3 met") 
+             break
+          # else preserve old values
+          if (mu<=2.0*alphai-alphai1):
+             alphai1=alphai
+             alphai=mu
+          else:
+             # choose by interpolation in [2*alphai-alphai1,min(mu,alphai+t1*(alphai-alphai1)] 
+            p01=2.0*alphai-alphai1;
+            p02=min(mu,alphai+t1*(alphai-alphai1))
+            alphai=self._cubic_interpolate(closure,xk,pk,p01,p02,step)
+
+
+          phi_alphai1=phi_alphai;
+          # update function evals
+          closure_evals +=3
+          ci=ci+1
+
+          
+
+
+        # recover original params
+        self._copy_params_in(xk)
+        # update state
+        state['func_evals'] += closure_evals
+        return alphak
+
+
+    def _cubic_interpolate(self,closure,xk,pk,a,b,step):
+        """ Cubic interpolation within interval [a,b] or [b,a] (a>b is possible)
+          
+           Arguments:
+            closure (callable): A closure that reevaluates the model
+                and returns the loss.
+            xk: copy of parameter values 
+            pk: gradient vector 
+            a/b:  interval for interpolation
+            step: step size for differencing 
+        """
+
+
+        self._copy_params_in(xk)
+
+        # state parameter 
+        state = self.state[self._params[0]]
+        # count function evals
+        closure_evals=0
+
+        # xp <- xk+a. pk
+        self._add_grad(a, pk) #FF param = param + t * grad 
+        f0=float(closure())
+        # xp <- xk+(a+step). pk
+        self._add_grad(step, pk) #FF param = param + t * grad 
+        p01=float(closure())
+        # xp <- xk+(a-step). pk
+        self._add_grad(-2.0*step, pk) #FF param = param - t * grad 
+        p02=float(closure())
+        f0d=(p01-p02)/(2.0*step)
+
+        # xp <- xk+b. pk
+        self._add_grad(-a+step+b, pk) #FF param = param + t * grad 
+        f1=float(closure())
+        # xp <- xk+(b+step). pk
+        self._add_grad(step, pk) #FF param = param + t * grad 
+        p01=float(closure())
+        # xp <- xk+(b-step). pk
+        self._add_grad(-2.0*step, pk) #FF param = param - t * grad 
+        p02=float(closure())
+        f1d=(p01-p02)/(2.0*step)
+
+        closure_evals=6
+
+        aa=3.0*(f0-f1)/(b-a)+f1d-f0d
+        p01=aa*aa-f0d*f1d
+        if (p01>0.0):
+           cc=math.sqrt(p01)
+           z0=b-(f1d+cc-aa)*(b-a)/(f1d-f0d+2.0*cc)
+           aa=max(a,b)
+           cc=min(a,b)
+           if z0>aa or z0<cc:
+             fz0=f0+f1
+           else:
+             # xp <- xk+(a+z0*(b-a))*pk
+             self._add_grad(-b+step+a+z0*(b-a), pk) #FF param = param + t * grad 
+             fz0=float(closure())
+             closure_evals +=1
+
+           # update state
+           state['func_evals'] += closure_evals
+
+           if f0<f1 and f0<fz0:
+             return a
+
+           if f1<fz0:
+             return b
+           # else
+           return z0
+        else:
+
+           # update state
+           state['func_evals'] += closure_evals
+
+           if f0<f1:
+             return a
+           else:
+             return b
+
+        # update state
+        state['func_evals'] += closure_evals
+
+        # fallback value
+        return 0.0
+     
+
+
+
+    #FF bracket [a,b]
+    # xk: copy of parameters, use it to refresh self._param 
+    def _linesearch_zoom(self,closure,xk,pk,a,b,phi_0,gphi_0,sigma,rho,t1,t2,t3,step):
+        """Zoom step in line search
+
+        Arguments:
+            closure (callable): A closure that reevaluates the model
+                and returns the loss.
+            xk: copy of parameter values 
+            pk: gradient vector 
+            a/b:  bracket interval for line search, 
+            phi_0: phi(0)
+            gphi_0: grad(phi(0))
+            sigma,rho,t1,t2,t3: line search parameters (from Fletcher) 
+            step: step size for differencing 
+        """
+
+        # state parameter 
+        state = self.state[self._params[0]]
+        # count function evals
+        closure_evals=0
+
+        aj=a
+        bj=b
+        ci=0
+        while ci<10:
+           # choose alphaj from [a+t2(b-a),b-t3(b-a)]
+           p01=aj+t2*(bj-aj)
+           p02=bj-t3*(bj-aj)
+           alphaj=self._cubic_interpolate(closure,xk,pk,p01,p02,step)
+
+           # evaluate phi(alphaj)
+           self._copy_params_in(xk)
+           # xp <- xk+alphaj. pk
+           self._add_grad(alphaj, pk) #FF param = param + t * grad 
+           phi_j=float(closure())
+          
+           # evaluate phi(aj)
+           # xp <- xk+aj. pk
+           self._add_grad(-alphaj+aj, pk) #FF param = param + t * grad 
+           phi_aj=float(closure())
+
+           closure_evals +=2
+
+           if (phi_j>phi_0+rho*alphaj*gphi_0) or phi_j>=phi_aj :
+              bj=alphaj # aj is unchanged
+           else:
+              # evaluate grad(alphaj)
+              # xp <- xk+(alphaj+step). pk
+              self._add_grad(-aj+alphaj+step, pk) #FF param = param + t * grad 
+              p01=float(closure())
+              # xp <- xk+(alphaj-step). pk
+              self._add_grad(-2.0*step, pk) #FF param = param + t * grad 
+              p02=float(closure())
+              gphi_j=(p01-p02)/(2.0*step)
+        
+
+              closure_evals +=2
+
+              # termination due to roundoff/other errors pp. 38, Fletcher
+              if (aj-alphaj)*gphi_j <= step:
+                 alphak=alphaj
+                 found_step=True
+                 break
+             
+              if abs(gphi_j)<=-sigma*gphi_0 :
+                 alphak=alphaj
+                 found_step=True
+                 break
+
+              if gphi_j*(bj-aj)>=0.0:
+                 bj=aj
+              # else bj is unchanged
+              aj=alphaj
+
+
+           ci=ci+1
+        
+        if not found_step:
+          alphak=alphaj
+
+        # update state
+        state['func_evals'] += closure_evals
+
+        return alphak
+
 
     def step(self, closure):
         """Performs a single optimization step.
@@ -202,11 +520,18 @@ class LBFGS(Optimizer):
             ls_func_evals = 0
             if line_search_fn is not None:
                 # perform line search, using user function
-                raise RuntimeError("line search function is not supported yet")
+                ##raise RuntimeError("line search function is not supported yet")
+                #FF#################################
+                t=self._linesearch(closure,d,float(t)) 
+                self._add_grad(t, d) #FF param = param + t * grad 
+                print('step size='+str(t))
+                #FF#################################
             else:
+                #FF Here, t = stepsize,  d = -grad, in cache
                 # no line search, simply move with fixed-step
-                self._add_grad(t, d)
-                if n_iter != max_iter:
+                self._add_grad(t, d) #FF param = param + t * grad 
+                print('step size='+str(t))
+            if n_iter != max_iter:
                     # re-evaluate function only if not in last iteration
                     # the reason we do this: in a stochastic setting,
                     # no use to re-evaluate that function here
@@ -214,6 +539,8 @@ class LBFGS(Optimizer):
                     flat_grad = self._gather_flat_grad()
                     abs_grad_sum = flat_grad.abs().sum()
                     ls_func_evals = 1
+                    #FF####################################
+                    #FF####################################
 
             # update func eval
             current_evals += ls_func_evals
