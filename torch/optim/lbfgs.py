@@ -4,6 +4,7 @@ from .optimizer import Optimizer
 
 import math
 
+be_verbose=False
 
 class LBFGS(Optimizer):
     """Implements L-BFGS algorithm.
@@ -32,16 +33,20 @@ class LBFGS(Optimizer):
         tolerance_change (float): termination tolerance on function
             value/parameter changes (default: 1e-9).
         history_size (int): update history size (default: 100).
+        line_search_fn: True (cubic interpolation step size), False: fixed step size
+        doadam: True (use exp. averaged gradient for Hessian update)
+        beta: constant for exp. averaging : default 0.1
     """
 
     def __init__(self, params, lr=1, max_iter=20, max_eval=None,
                  tolerance_grad=1e-5, tolerance_change=1e-9, history_size=100,
-                 line_search_fn=None):
+                 line_search_fn=None, doadam=False, beta=0.1):
         if max_eval is None:
             max_eval = max_iter * 5 // 4
         defaults = dict(lr=lr, max_iter=max_iter, max_eval=max_eval,
                         tolerance_grad=tolerance_grad, tolerance_change=tolerance_change,
-                        history_size=history_size, line_search_fn=line_search_fn)
+                        history_size=history_size, line_search_fn=line_search_fn,
+                        doadam=doadam, beta=beta)
         super(LBFGS, self).__init__(params, defaults)
 
         if len(self.param_groups) != 1:
@@ -162,13 +167,16 @@ class LBFGS(Optimizer):
           phi_alphai=float(closure())
           if phi_alphai<tol:
              alphak=alphai 
-             print("Linesearch: condition 0 met")
+             if be_verbose:
+              print("Linesearch: condition 0 met")
              break
           if (phi_alphai>phi_0+alphai*gphi_0) or (ci>1 and phi_alphai>=phi_alphai1) :
              # ai=alphai1, bi=alphai bracket
-             print("bracket "+str(alphai1)+","+str(alphai))
+             if be_verbose:
+              print("bracket "+str(alphai1)+","+str(alphai))
              alphak=self._linesearch_zoom(closure,xk,pk,alphai1,alphai,phi_0,gphi_0,sigma,rho,t1,t2,t3,step)
-             print("Linesearch: condition 1 met") 
+             if be_verbose:
+              print("Linesearch: condition 1 met") 
              break
 
           # evaluate grad(phi(alpha(i))) */
@@ -183,14 +191,17 @@ class LBFGS(Optimizer):
         
           if (abs(gphi_i)<=-sigma*gphi_0):
              alphak=alphai
-             print("Linesearch: condition 2 met") 
+             if be_verbose:
+              print("Linesearch: condition 2 met") 
              break
 
           if gphi_i>=0.0 :
              # ai=alphai, bi=alphai1 bracket
-             print("bracket "+str(alphai)+","+str(alphai1))
+             if be_verbose:
+              print("bracket "+str(alphai)+","+str(alphai1))
              alphak=self._linesearch_zoom(closure,xk,pk,alphai,alphai1,phi_0,gphi_0,sigma,rho,t1,t2,t3,step)
-             print("Linesearch: condition 3 met") 
+             if be_verbose:
+              print("Linesearch: condition 3 met") 
              break
           # else preserve old values
           if (mu<=2.0*alphai-alphai1):
@@ -266,6 +277,9 @@ class LBFGS(Optimizer):
         p01=aa*aa-f0d*f1d
         if (p01>0.0):
            cc=math.sqrt(p01)
+           #print('f0='+str(f0d)+' f1='+str(f1d)+' cc='+str(cc))
+           if (f1d-f0d+2.0*cc)==0.0:
+             return 0.0
            z0=b-(f1d+cc-aa)*(b-a)/(f1d-f0d+2.0*cc)
            aa=max(a,b)
            cc=min(a,b)
@@ -331,6 +345,7 @@ class LBFGS(Optimizer):
         aj=a
         bj=b
         ci=0
+        found_step=False
         while ci<10:
            # choose alphaj from [a+t2(b-a),b-t3(b-a)]
            p01=aj+t2*(bj-aj)
@@ -411,11 +426,21 @@ class LBFGS(Optimizer):
         line_search_fn = group['line_search_fn']
         history_size = group['history_size']
 
+
         # NOTE: LBFGS has only global state, but we register it as state for
         # the first param, because this helps with casting in load_state_dict
         state = self.state[self._params[0]]
         state.setdefault('func_evals', 0)
         state.setdefault('n_iter', 0)
+        state.setdefault('step', 0)
+
+        doadam=group['doadam']
+        if doadam==True:
+          if len(state)==0:
+           state['step']=0 
+          else:
+           state['step']+=1 
+
 
         # evaluate initial f(x) and df/dx
         orig_loss = closure()
@@ -435,8 +460,17 @@ class LBFGS(Optimizer):
         old_dirs = state.get('old_dirs')
         old_stps = state.get('old_stps')
         H_diag = state.get('H_diag')
+        # note: if doadam==True, flat_grad returns prev. value of exp. avg
         prev_flat_grad = state.get('prev_flat_grad')
         prev_loss = state.get('prev_loss')
+
+        # replace gradiant with exponential average 
+        if doadam==True:
+           beta1=group['beta']
+           if state['step']>1: 
+            flat_grad.mul_(1-beta1).add_(beta1,prev_flat_grad)
+            bias_correction1= 1.0/(1 - beta1**state['step'])
+            flat_grad.mul_(bias_correction1)
 
         n_iter = 0
         # optimize for a max of max_iter iterations
@@ -456,6 +490,7 @@ class LBFGS(Optimizer):
             else:
                 # do lbfgs update (update memory)
                 y = flat_grad.sub(prev_flat_grad)
+
                 s = d.mul(t)
                 ys = y.dot(s)  # y*s
                 if ys > 1e-10:
@@ -502,6 +537,7 @@ class LBFGS(Optimizer):
                 prev_flat_grad = flat_grad.clone()
             else:
                 prev_flat_grad.copy_(flat_grad)
+
             prev_loss = loss
 
             ############################################################
@@ -523,14 +559,16 @@ class LBFGS(Optimizer):
                 ##raise RuntimeError("line search function is not supported yet")
                 #FF#################################
                 t=self._linesearch(closure,d,float(t)) 
-                self._add_grad(t, d) #FF param = param + t * grad 
-                print('step size='+str(t))
+                self._add_grad(t, d) #FF param = param + t * d 
+                if be_verbose:
+                 print('step size='+str(t))
                 #FF#################################
             else:
                 #FF Here, t = stepsize,  d = -grad, in cache
                 # no line search, simply move with fixed-step
-                self._add_grad(t, d) #FF param = param + t * grad 
-                print('step size='+str(t))
+                self._add_grad(t, d) #FF param = param + t * d 
+                if be_verbose:
+                 print('step size='+str(t))
             if n_iter != max_iter:
                     # re-evaluate function only if not in last iteration
                     # the reason we do this: in a stochastic setting,
