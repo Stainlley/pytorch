@@ -25,22 +25,22 @@ class LBFGS(Optimizer):
     Arguments:
         lr (float): learning rate (default: 1)
         max_iter (int): maximal number of iterations per optimization step
-            (default: 20)
+            (default: 10)
         max_eval (int): maximal number of function evaluations per optimization
             step (default: max_iter * 1.25).
         tolerance_grad (float): termination tolerance on first order optimality
             (default: 1e-5).
         tolerance_change (float): termination tolerance on function
             value/parameter changes (default: 1e-9).
-        history_size (int): update history size (default: 100).
-        line_search_fn: True (cubic interpolation step size), False: fixed step size
-        doadam: True (use exp. averaged gradient for Hessian update)
-        beta: constant for exp. averaging : default 0.1
+        history_size (int): update history size (default: 7).
+        line_search_fn: if True, use cubic interpolation to findstep size, if False: fixed step size
+        doadam: if True, use exp. averaging to find secant update 'y' (for inv. Hessian update)
+        beta: constant for exp. averaging : default 0.9
     """
 
-    def __init__(self, params, lr=1, max_iter=20, max_eval=None,
-                 tolerance_grad=1e-5, tolerance_change=1e-9, history_size=100,
-                 line_search_fn=None, doadam=False, beta=0.1):
+    def __init__(self, params, lr=1, max_iter=10, max_eval=None,
+                 tolerance_grad=1e-5, tolerance_change=1e-9, history_size=7,
+                 line_search_fn=None, doadam=False, beta=0.9):
         if max_eval is None:
             max_eval = max_iter * 5 // 4
         defaults = dict(lr=lr, max_iter=max_iter, max_eval=max_eval,
@@ -149,6 +149,9 @@ class LBFGS(Optimizer):
           return 1.0
 
         mu=(tol-phi_0)/(rho*gphi_0)
+        # catch if mu is not finite
+        if math.isnan(mu):
+           return 1.0
 
         ##print("mu="+str(mu))
         
@@ -279,7 +282,7 @@ class LBFGS(Optimizer):
            cc=math.sqrt(p01)
            #print('f0='+str(f0d)+' f1='+str(f1d)+' cc='+str(cc))
            if (f1d-f0d+2.0*cc)==0.0:
-             return 0.0
+             return (a+b)*0.5
            z0=b-(f1d+cc-aa)*(b-a)/(f1d-f0d+2.0*cc)
            aa=max(a,b)
            cc=min(a,b)
@@ -315,7 +318,7 @@ class LBFGS(Optimizer):
         state['func_evals'] += closure_evals
 
         # fallback value
-        return 0.0
+        return (a+b)*0.5
      
 
 
@@ -432,15 +435,8 @@ class LBFGS(Optimizer):
         state = self.state[self._params[0]]
         state.setdefault('func_evals', 0)
         state.setdefault('n_iter', 0)
-        state.setdefault('step', 0)
 
         doadam=group['doadam']
-        if doadam==True:
-          if len(state)==0:
-           state['step']=0 
-          else:
-           state['step']+=1 
-
 
         # evaluate initial f(x) and df/dx
         orig_loss = closure()
@@ -460,21 +456,17 @@ class LBFGS(Optimizer):
         old_dirs = state.get('old_dirs')
         old_stps = state.get('old_stps')
         H_diag = state.get('H_diag')
-        # note: if doadam==True, flat_grad returns prev. value of exp. avg
         prev_flat_grad = state.get('prev_flat_grad')
         prev_loss = state.get('prev_loss')
 
-        # replace gradiant with exponential average 
-        if doadam==True:
+        # replace y with exponential average 
+        if doadam:
+           prev_y= state.get('prev_y')
            beta1=group['beta']
-           if state['step']>1: 
-            flat_grad.mul_(1-beta1).add_(beta1,prev_flat_grad)
-            bias_correction1= 1.0/(1 - beta1**state['step'])
-            flat_grad.mul_(bias_correction1)
 
         n_iter = 0
         # optimize for a max of max_iter iterations
-        while n_iter < max_iter:
+        while n_iter < max_iter and not math.isnan(flat_grad.norm().item()):
             # keep track of nb of iterations
             n_iter += 1
             state['n_iter'] += 1
@@ -488,8 +480,12 @@ class LBFGS(Optimizer):
                 old_stps = []
                 H_diag = 1
             else:
-                # do lbfgs update (update memory)
+                # do lbfgs update (update memory) 
+                # what happens if current and prev grad are equal, ||y||->0 ??
                 y = flat_grad.sub(prev_flat_grad)
+                if doadam==True:
+                   # exponential average y
+                   y.mul_(beta1).add_(1-beta1,prev_y)
 
                 s = d.mul(t)
                 ys = y.dot(s)  # y*s
@@ -506,6 +502,9 @@ class LBFGS(Optimizer):
 
                     # update scale of initial Hessian approximation
                     H_diag = ys / y.dot(y)  # (y*y)
+
+                if math.isnan(H_diag):
+                  print('Warning H_diag nan')
 
                 # compute the approximate (L-BFGS) inverse Hessian
                 # multiplied by the gradient
@@ -538,6 +537,12 @@ class LBFGS(Optimizer):
             else:
                 prev_flat_grad.copy_(flat_grad)
 
+            if doadam:
+              if state['n_iter'] == 1:
+               prev_y=flat_grad.clone() 
+              else:
+               prev_y.copy_(y)
+
             prev_loss = loss
 
             ############################################################
@@ -552,6 +557,11 @@ class LBFGS(Optimizer):
             # directional derivative
             gtd = flat_grad.dot(d)  # g * d
 
+            if math.isnan(gtd.item()):
+              print('Warning grad norm infinite')
+              print('iter %d'%state['n_iter'])
+              print('||grad||=%f'%flat_grad.norm().item())
+              print('||d||=%f'%d.norm().item())
             # optional line search: user function
             ls_func_evals = 0
             if line_search_fn is not None:
@@ -559,6 +569,9 @@ class LBFGS(Optimizer):
                 ##raise RuntimeError("line search function is not supported yet")
                 #FF#################################
                 t=self._linesearch(closure,d,float(t)) 
+                if math.isnan(t):
+                  print('Warning: stepsize nan')
+                  t=lr
                 self._add_grad(t, d) #FF param = param + t * d 
                 if be_verbose:
                  print('step size='+str(t))
@@ -577,8 +590,6 @@ class LBFGS(Optimizer):
                     flat_grad = self._gather_flat_grad()
                     abs_grad_sum = flat_grad.abs().sum()
                     ls_func_evals = 1
-                    #FF####################################
-                    #FF####################################
 
             # update func eval
             current_evals += ls_func_evals
@@ -612,5 +623,8 @@ class LBFGS(Optimizer):
         state['H_diag'] = H_diag
         state['prev_flat_grad'] = prev_flat_grad
         state['prev_loss'] = prev_loss
+   
+        if doadam:
+          state['prev_y']=prev_y
 
         return orig_loss
