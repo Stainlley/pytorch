@@ -349,7 +349,7 @@ class LBFGS(Optimizer):
         bj=b
         ci=0
         found_step=False
-        while ci<10:
+        while ci<4: # original 10
            # choose alphaj from [a+t2(b-a),b-t3(b-a)]
            p01=aj+t2*(bj-aj)
            p02=bj-t3*(bj-aj)
@@ -461,7 +461,6 @@ class LBFGS(Optimizer):
 
         # replace y with exponential average 
         if doadam:
-           prev_y= state.get('prev_y')
            beta1=group['beta']
 
         n_iter = 0
@@ -484,8 +483,12 @@ class LBFGS(Optimizer):
                 # what happens if current and prev grad are equal, ||y||->0 ??
                 y = flat_grad.sub(prev_flat_grad)
                 if doadam==True:
-                   # exponential average y
-                   y.mul_(beta1).add_(1-beta1,prev_y)
+                   # get previous y from old_dirs, if it exists
+                   ylength=len(old_dirs)
+                   if ylength>=1:
+                    prev_y=old_dirs[ylength-1]
+                    # exponential average y
+                    y.mul_(beta1).add_(1-beta1,prev_y)
 
                 s = d.mul(t)
                 ys = y.dot(s)  # y*s
@@ -536,12 +539,6 @@ class LBFGS(Optimizer):
                 prev_flat_grad = flat_grad.clone()
             else:
                 prev_flat_grad.copy_(flat_grad)
-
-            if doadam:
-              if state['n_iter'] == 1:
-               prev_y=flat_grad.clone() 
-              else:
-               prev_y.copy_(y)
 
             prev_loss = loss
 
@@ -624,7 +621,5 @@ class LBFGS(Optimizer):
         state['prev_flat_grad'] = prev_flat_grad
         state['prev_loss'] = prev_loss
    
-        if doadam:
-          state['prev_y']=prev_y
 
         return orig_loss
