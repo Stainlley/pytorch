@@ -34,19 +34,17 @@ class LBFGS(Optimizer):
             value/parameter changes (default: 1e-9).
         history_size (int): update history size (default: 7).
         line_search_fn: if True, use cubic interpolation to findstep size, if False: fixed step size
-        doadam: if True, use exp. averaging to find secant update 'y' (for inv. Hessian update)
-        beta: constant for exp. averaging : default 0.9
     """
 
     def __init__(self, params, lr=1, max_iter=10, max_eval=None,
                  tolerance_grad=1e-5, tolerance_change=1e-9, history_size=7,
-                 line_search_fn=None, doadam=False, beta=0.9):
+                 line_search_fn=False):
         if max_eval is None:
             max_eval = max_iter * 5 // 4
         defaults = dict(lr=lr, max_iter=max_iter, max_eval=max_eval,
                         tolerance_grad=tolerance_grad, tolerance_change=tolerance_change,
                         history_size=history_size, line_search_fn=line_search_fn,
-                        doadam=doadam, beta=beta)
+                        )
         super(LBFGS, self).__init__(params, defaults)
 
         if len(self.param_groups) != 1:
@@ -116,13 +114,13 @@ class LBFGS(Optimizer):
 
 
         # constants
-        alpha1=10.0
+        alpha1=10*self.param_groups[0]['lr']#10.0
         sigma=0.1
         rho=0.01
         t1=9 
         t2=0.1
         t3=0.5
-        alphak=step # default return step
+        alphak=self.param_groups[0]['lr']# default return step
  
         # state parameter 
         state = self.state[self._params[0]]
@@ -162,7 +160,7 @@ class LBFGS(Optimizer):
         alphai=alpha1 # initial value for alpha(i) : check if 0<alphai<=mu 
         alphai1=0.0
         phi_alphai1=phi_0
-        while (ci<10) :
+        while (ci<4) : # FIXME
           # evalualte phi(alpha(i))=f(xk+alphai pk)
           self._copy_params_in(xk) # original
           # xp <- xk+alphai. pk
@@ -349,7 +347,7 @@ class LBFGS(Optimizer):
         bj=b
         ci=0
         found_step=False
-        while ci<4: # original 10
+        while ci<4: # FIXME original 10
            # choose alphaj from [a+t2(b-a),b-t3(b-a)]
            p01=aj+t2*(bj-aj)
            p02=bj-t3*(bj-aj)
@@ -436,7 +434,6 @@ class LBFGS(Optimizer):
         state.setdefault('func_evals', 0)
         state.setdefault('n_iter', 0)
 
-        doadam=group['doadam']
 
         # evaluate initial f(x) and df/dx
         orig_loss = closure()
@@ -459,10 +456,6 @@ class LBFGS(Optimizer):
         prev_flat_grad = state.get('prev_flat_grad')
         prev_loss = state.get('prev_loss')
 
-        # replace y with exponential average 
-        if doadam:
-           beta1=group['beta']
-
         n_iter = 0
         # optimize for a max of max_iter iterations
         while n_iter < max_iter and not math.isnan(flat_grad.norm().item()):
@@ -482,18 +475,30 @@ class LBFGS(Optimizer):
                 # do lbfgs update (update memory) 
                 # what happens if current and prev grad are equal, ||y||->0 ??
                 y = flat_grad.sub(prev_flat_grad)
-                if doadam==True:
-                   # get previous y from old_dirs, if it exists
-                   ylength=len(old_dirs)
-                   if ylength>=1:
-                    prev_y=old_dirs[ylength-1]
-                    # exponential average y
-                    y.mul_(beta1).add_(1-beta1,prev_y)
 
                 s = d.mul(t)
                 ys = y.dot(s)  # y*s
-                if ys > 1e-10:
-                    # updating memory
+                batch_changed= (n_iter==1 and state['n_iter']>1)
+                if batch_changed: # batch has changed
+                   # prune old dirs
+                   bad_loc=[]
+                   for ci in range(len(old_dirs)):
+                     #print('ci=%d ys=%f'%(ci,old_dirs[ci].dot(s))) 
+                     if old_dirs[ci].dot(s)<0.0:
+                       bad_loc.append(ci)
+                   #print('%d: bad %d total %d'%(state['n_iter'],len(bad_loc),len(old_dirs)))
+                   if len(bad_loc) > 0:
+                      old_dirs1=[]
+                      old_stps1=[]
+                      for ci in range(len(old_dirs)): 
+                       if ci not in bad_loc: 
+                        old_dirs1.append(old_dirs[ci])
+                        old_stps1.append(old_stps[ci])
+                      old_dirs=old_dirs1
+                      old_stps=old_stps1
+                   
+                if ys > 1e-10 and not batch_changed :
+                    # updating memory (only when we have y within a single batch)
                     if len(old_dirs) == history_size:
                         # shift history by one (limited-memory)
                         old_dirs.pop(0)
@@ -561,11 +566,11 @@ class LBFGS(Optimizer):
               print('||d||=%f'%d.norm().item())
             # optional line search: user function
             ls_func_evals = 0
-            if line_search_fn is not None:
+            if line_search_fn:
                 # perform line search, using user function
                 ##raise RuntimeError("line search function is not supported yet")
                 #FF#################################
-                t=self._linesearch(closure,d,float(t)) 
+                t=self._linesearch(closure,d,1e-6) 
                 if math.isnan(t):
                   print('Warning: stepsize nan')
                   t=lr
