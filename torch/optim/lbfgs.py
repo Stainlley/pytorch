@@ -34,17 +34,18 @@ class LBFGS(Optimizer):
             value/parameter changes (default: 1e-9).
         history_size (int): update history size (default: 7).
         line_search_fn: if True, use cubic interpolation to findstep size, if False: fixed step size
+        batch_mode: True for stochastic version (default False)
     """
 
     def __init__(self, params, lr=1, max_iter=10, max_eval=None,
                  tolerance_grad=1e-5, tolerance_change=1e-9, history_size=7,
-                 line_search_fn=False):
+                 line_search_fn=False, batch_mode=False):
         if max_eval is None:
             max_eval = max_iter * 5 // 4
         defaults = dict(lr=lr, max_iter=max_iter, max_eval=max_eval,
                         tolerance_grad=tolerance_grad, tolerance_change=tolerance_change,
                         history_size=history_size, line_search_fn=line_search_fn,
-                        )
+                        batch_mode=batch_mode)
         super(LBFGS, self).__init__(params, defaults)
 
         if len(self.param_groups) != 1:
@@ -101,8 +102,61 @@ class LBFGS(Optimizer):
             offset += numel
         assert offset == self._numel()
 
+    #FF line search xk=self._params, pk=step direction, gk=gradient, alphabar=max. step size
+    def _linesearch_backtrack(self,closure,pk,gk,alphabar):
+        """Line search (backtracking)
+
+        Arguments:
+            closure (callable): A closure that reevaluates the model
+                and returns the loss.
+            pk: step direction vector
+            gk: gradient vector 
+            alphabar: max step size
+        """
+
+
+        # constants
+        c1=1e-4
+        alphak=alphabar# default return step
+ 
+        # state parameter 
+        state = self.state[self._params[0]]
+
+        # make a copy of original params
+        xk=self._copy_params_out()
+
+   
+        f_old=float(closure())
+        # param = param + alphak * pk
+        self._add_grad(alphak, pk)
+        f_new=float(closure())
+
+        # prod = c1 * alphak * gk^T pk
+        s=gk.mul(c1) 
+        prodterm=s.dot(pk)
+
+        ci=0
+        if be_verbose:
+         print('LN %d alpha=%f fnew=%f fold=%f prod=%f'%(ci,alphak,f_new,f_old,prodterm))
+        while (ci<15 and f_new > f_old + alphak*prodterm):
+           alphak=0.5*alphak
+           self._copy_params_in(xk)
+           self._add_grad(alphak, pk)
+           f_new=float(closure())
+           if be_verbose:
+             print('LN %d alpha=%f fnew=%f fold=%f'%(ci,alphak,f_new,f_old))
+           ci=ci+1
+
+        # recover original params
+        self._copy_params_in(xk)
+        # update state
+        state['func_evals'] += ci
+        return alphak
+
+
+
     #FF line search xk=self._params, pk=gradient
-    def _linesearch(self,closure,pk,step):
+    def _linesearch_cubic(self,closure,pk,step):
         """Line search (strong-Wolfe)
 
         Arguments:
@@ -427,6 +481,8 @@ class LBFGS(Optimizer):
         line_search_fn = group['line_search_fn']
         history_size = group['history_size']
 
+        batch_mode = group['batch_mode']
+
 
         # NOTE: LBFGS has only global state, but we register it as state for
         # the first param, because this helps with casting in load_state_dict
@@ -457,6 +513,11 @@ class LBFGS(Optimizer):
         prev_loss = state.get('prev_loss')
 
         n_iter = 0
+
+        if batch_mode:
+          alphabar=lr
+          lm0=1e-6
+
         # optimize for a max of max_iter iterations
         while n_iter < max_iter and not math.isnan(flat_grad.norm().item()):
             # keep track of nb of iterations
@@ -471,32 +532,45 @@ class LBFGS(Optimizer):
                 old_dirs = []
                 old_stps = []
                 H_diag = 1
+
+
             else:
+                if batch_mode:
+                 running_avg=state.get('running_avg')
+                 running_avg_sq=state.get('running_avg_sq')
+                 if running_avg is None:
+                  running_avg=torch.zeros_like(flat_grad.data)
+                  running_avg_sq=torch.zeros_like(flat_grad.data)
+
                 # do lbfgs update (update memory) 
                 # what happens if current and prev grad are equal, ||y||->0 ??
                 y = flat_grad.sub(prev_flat_grad)
 
                 s = d.mul(t)
+
+                if batch_mode: # y = y+ lm0 * s, to have a trust region
+                  y.add_(lm0,s)
+
                 ys = y.dot(s)  # y*s
-                batch_changed= (n_iter==1 and state['n_iter']>1)
+                # FIXME batch_changed does not work for full batch mode (data might be the same)
+                batch_changed= batch_mode and (n_iter==1 and state['n_iter']>1)
                 if batch_changed: # batch has changed
-                   # prune old dirs
-                   bad_loc=[]
-                   for ci in range(len(old_dirs)):
-                     #print('ci=%d ys=%f'%(ci,old_dirs[ci].dot(s))) 
-                     if old_dirs[ci].dot(s)<0.0:
-                       bad_loc.append(ci)
-                   #print('%d: bad %d total %d'%(state['n_iter'],len(bad_loc),len(old_dirs)))
-                   if len(bad_loc) > 0:
-                      old_dirs1=[]
-                      old_stps1=[]
-                      for ci in range(len(old_dirs)): 
-                       if ci not in bad_loc: 
-                        old_dirs1.append(old_dirs[ci])
-                        old_stps1.append(old_stps[ci])
-                      old_dirs=old_dirs1
-                      old_stps=old_stps1
-                   
+                   # online estimate of mean,variance of gradient (inter-batch, not intra-batch)
+                   # newmean <- oldmean + (grad - oldmean)/niter
+                   # moment <- oldmoment + (grad-oldmean)(grad-newmean)
+                   # variance = moment/(niter-1)
+
+                   g_old=flat_grad.clone()
+                   g_old.add_(-1.0,running_avg) # grad-oldmean
+                   running_avg.add_(1.0/state['n_iter'],g_old) # newmean
+                   g_new=flat_grad.clone()
+                   g_new.add_(-1.0,running_avg) # grad-newmean
+                   running_avg_sq.addcmul_(1,g_new,g_old) # +(grad-newmean)(grad-oldmean)
+                   alphabar=1/(1+running_avg_sq.sum()/((state['n_iter']-1)*(flat_grad.norm().item())))
+                   if be_verbose:
+                     print('iter %d |mean| %f |var| %f ||grad|| %f step %f y^Ts %f alphabar=%f'%(state['n_iter'],running_avg.sum(),running_avg_sq.sum()/(state['n_iter']-1),flat_grad.norm().item(),t,ys,alphabar))
+
+
                 if ys > 1e-10 and not batch_changed :
                     # updating memory (only when we have y within a single batch)
                     if len(old_dirs) == history_size:
@@ -542,6 +616,7 @@ class LBFGS(Optimizer):
 
             if prev_flat_grad is None:
                 prev_flat_grad = flat_grad.clone()
+
             else:
                 prev_flat_grad.copy_(flat_grad)
 
@@ -570,20 +645,22 @@ class LBFGS(Optimizer):
                 # perform line search, using user function
                 ##raise RuntimeError("line search function is not supported yet")
                 #FF#################################
-                t=self._linesearch(closure,d,1e-6) 
+                if not batch_mode:
+                 t=self._linesearch_cubic(closure,d,1e-6) 
+                else:
+                 t=self._linesearch_backtrack(closure,d,flat_grad,alphabar)
+
                 if math.isnan(t):
                   print('Warning: stepsize nan')
                   t=lr
                 self._add_grad(t, d) #FF param = param + t * d 
                 if be_verbose:
-                 print('step size='+str(t))
+                 print('step size=%f'%(t))
                 #FF#################################
             else:
                 #FF Here, t = stepsize,  d = -grad, in cache
                 # no line search, simply move with fixed-step
                 self._add_grad(t, d) #FF param = param + t * d 
-                if be_verbose:
-                 print('step size='+str(t))
             if n_iter != max_iter:
                     # re-evaluate function only if not in last iteration
                     # the reason we do this: in a stochastic setting,
@@ -591,6 +668,9 @@ class LBFGS(Optimizer):
                     loss = float(closure())
                     flat_grad = self._gather_flat_grad()
                     abs_grad_sum = flat_grad.abs().sum()
+                    if math.isnan(abs_grad_sum):
+                       print('Warning: gradient nan')
+                       break
                     ls_func_evals = 1
 
             # update func eval
@@ -625,6 +705,10 @@ class LBFGS(Optimizer):
         state['H_diag'] = H_diag
         state['prev_flat_grad'] = prev_flat_grad
         state['prev_loss'] = prev_loss
+
+        if batch_mode:
+         state['running_avg']=running_avg
+         state['running_avg_sq']=running_avg_sq
    
 
         return orig_loss
