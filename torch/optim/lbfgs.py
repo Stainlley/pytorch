@@ -23,7 +23,7 @@ class LBFGS(Optimizer):
         try reducing the history size, or use a different algorithm.
 
     Arguments:
-        lr (float): learning rate (default: 1)
+        lr (float): learning rate (fallback value when line search fails. not really needed) (default: 1)
         max_iter (int): maximal number of iterations per optimization step
             (default: 10)
         max_eval (int): maximal number of function evaluations per optimization
@@ -35,6 +35,15 @@ class LBFGS(Optimizer):
         history_size (int): update history size (default: 7).
         line_search_fn: if True, use cubic interpolation to findstep size, if False: fixed step size
         batch_mode: True for stochastic version (default False)
+
+        Example usage for full batch mode:
+
+          optimizer = torch.optim.LBFGS(model.parameters(), history_size=7, max_iter=100, line_search_fn=True, batch_mode=False)
+
+        Example usage for batch mode (stochastic):
+
+          optimizer = torch.optim.LBFGS(net.parameters(), history_size=7, max_iter=4, line_search_fn=True,batch_mode=True)
+
     """
 
     def __init__(self, params, lr=1, max_iter=10, max_eval=None,
@@ -519,7 +528,8 @@ class LBFGS(Optimizer):
           lm0=1e-6
 
         # optimize for a max of max_iter iterations
-        while n_iter < max_iter and not math.isnan(flat_grad.norm().item()):
+        grad_nrm=flat_grad.norm().item()
+        while n_iter < max_iter and not math.isnan(grad_nrm):
             # keep track of nb of iterations
             n_iter += 1
             state['n_iter'] += 1
@@ -566,9 +576,9 @@ class LBFGS(Optimizer):
                    g_new=flat_grad.clone()
                    g_new.add_(-1.0,running_avg) # grad-newmean
                    running_avg_sq.addcmul_(1,g_new,g_old) # +(grad-newmean)(grad-oldmean)
-                   alphabar=1/(1+running_avg_sq.sum()/((state['n_iter']-1)*(flat_grad.norm().item())))
+                   alphabar=1/(1+running_avg_sq.sum()/((state['n_iter']-1)*(grad_nrm)))
                    if be_verbose:
-                     print('iter %d |mean| %f |var| %f ||grad|| %f step %f y^Ts %f alphabar=%f'%(state['n_iter'],running_avg.sum(),running_avg_sq.sum()/(state['n_iter']-1),flat_grad.norm().item(),t,ys,alphabar))
+                     print('iter %d |mean| %f |var| %f ||grad|| %f step %f y^Ts %f alphabar=%f'%(state['n_iter'],running_avg.sum(),running_avg_sq.sum()/(state['n_iter']-1),grad_nrm,t,ys,alphabar))
 
 
                 if ys > 1e-10 and not batch_changed :
@@ -637,7 +647,7 @@ class LBFGS(Optimizer):
             if math.isnan(gtd.item()):
               print('Warning grad norm infinite')
               print('iter %d'%state['n_iter'])
-              print('||grad||=%f'%flat_grad.norm().item())
+              print('||grad||=%f'%grad_nrm)
               print('||d||=%f'%d.norm().item())
             # optional line search: user function
             ls_func_evals = 0
