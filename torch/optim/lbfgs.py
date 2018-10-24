@@ -561,7 +561,8 @@ class LBFGS(Optimizer):
                 if batch_mode: # y = y+ lm0 * s, to have a trust region
                   y.add_(lm0,s)
 
-                ys = y.dot(s)  # y*s
+                ys = y.dot(s)  # y^T*s
+                sn = s.norm().item()  # ||s||
                 # FIXME batch_changed does not work for full batch mode (data might be the same)
                 batch_changed= batch_mode and (n_iter==1 and state['n_iter']>1)
                 if batch_changed: # batch has changed
@@ -581,7 +582,7 @@ class LBFGS(Optimizer):
                      print('iter %d |mean| %f |var| %f ||grad|| %f step %f y^Ts %f alphabar=%f'%(state['n_iter'],running_avg.sum(),running_avg_sq.sum()/(state['n_iter']-1),grad_nrm,t,ys,alphabar))
 
 
-                if ys > 1e-10 and not batch_changed :
+                if ys > 1e-10*sn*sn and not batch_changed :
                     # updating memory (only when we have y within a single batch)
                     if len(old_dirs) == history_size:
                         # shift history by one (limited-memory)
