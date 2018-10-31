@@ -718,6 +718,9 @@ class LBFGS(Optimizer):
         state['prev_loss'] = prev_loss
 
         if batch_mode:
+         if running_avg is None:
+           running_avg=torch.zeros_like(flat_grad.data)
+           running_avg_sq=torch.zeros_like(flat_grad.data)
          state['running_avg']=running_avg
          state['running_avg_sq']=running_avg_sq
    
