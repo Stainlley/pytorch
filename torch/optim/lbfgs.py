@@ -542,8 +542,9 @@ class LBFGS(Optimizer):
                 old_dirs = []
                 old_stps = []
                 H_diag = 1
-
-
+                if batch_mode:
+                 running_avg=torch.zeros_like(flat_grad.data)
+                 running_avg_sq=torch.zeros_like(flat_grad.data)
             else:
                 if batch_mode:
                  running_avg=state.get('running_avg')
