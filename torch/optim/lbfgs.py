@@ -175,7 +175,6 @@ class LBFGS(Optimizer):
             step: step size for differencing 
         """
 
-
         # constants
         alpha1=10*self.param_groups[0]['lr']#10.0
         sigma=0.1
@@ -657,10 +656,14 @@ class LBFGS(Optimizer):
                 # perform line search, using user function
                 ##raise RuntimeError("line search function is not supported yet")
                 #FF#################################
+                # Note: we disable gradient calculation during line search
+                # because it is not needed
+                torch.set_grad_enabled(False)
                 if not batch_mode:
                  t=self._linesearch_cubic(closure,d,1e-6) 
                 else:
                  t=self._linesearch_backtrack(closure,d,flat_grad,alphabar)
+                torch.set_grad_enabled(True)
 
                 if math.isnan(t):
                   print('Warning: stepsize nan')
