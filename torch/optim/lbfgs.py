@@ -133,8 +133,10 @@ class LBFGS(Optimizer):
         """
 
 
-        # constants
-        c1=1e-4
+        # constants (FIXME) find proper values
+        # c1: large values better for small batch sizes
+        c1=1e-1
+        citer=35
         alphak=alphabar# default return step
  
         # state parameter 
@@ -156,7 +158,7 @@ class LBFGS(Optimizer):
         ci=0
         if be_verbose:
          print('LN %d alpha=%f fnew=%f fold=%f prod=%f'%(ci,alphak,f_new,f_old,prodterm))
-        while (ci<15 and f_new > f_old + alphak*prodterm):
+        while (ci<citer and f_new > f_old + alphak*prodterm): 
            alphak=0.5*alphak
            self._copy_params_in(xk)
            self._add_grad(alphak, pk)
