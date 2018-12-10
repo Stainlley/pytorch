@@ -43,6 +43,15 @@ class LBFGS(Optimizer):
         Example usage for batch mode (stochastic):
 
           optimizer = torch.optim.LBFGS(net.parameters(), history_size=7, max_iter=4, line_search_fn=True,batch_mode=True)
+          Note: when using a closure(), only do backward() after checking the gradient is available,
+          Eg: 
+            def closure():
+             optimizer.zero_grad()
+             outputs=net(inputs)
+             loss=criterion(outputs,labels)
+             if loss.requires_grad:
+               loss.backward()
+             return loss
 
     """
 
